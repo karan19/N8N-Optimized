@@ -54,48 +54,37 @@ All resources are tagged with:
 ## Prerequisites
 - An AWS IAM user with permissions to deploy CloudFormation stacks, create EC2 instances, DynamoDB tables, and manage security groups.
 - A DNS record pointing the chosen `DomainName` to the EC2 instance's public IP (Caddy needs this to obtain certificates once the instance is running).
-- A local SSH key pair so you keep the private key; CloudFormation references a key pair name that you import beforehand. Example generation command:
-  ```bash
-  ssh-keygen -t ed25519 -f ~/.ssh/n8n-key -N ''
-  ```
 - AWS CLI configured with the desired region/account.
 
 ## Deployment
 
-### 1. Import your public key into EC2
-```bash
-aws ec2 import-key-pair --key-name N8N-KeyPair \
-  --public-key-material fileb://~/.ssh/n8n-key.pub
-```
-
-### 2. Create the stack
+### 1. Create the stack
 ```bash
 aws cloudformation create-stack \
   --stack-name N8N \
   --template-body file://cloudformation/template.yaml \
   --parameters ParameterKey=DomainName,ParameterValue=n8n.example.com \
                ParameterKey=N8nVersion,ParameterValue=1.121.3 \
-               ParameterKey=KeyPairName,ParameterValue=N8N-KeyPair \
                ParameterKey=BackupFrequencyMinutes,ParameterValue=60 \
                ParameterKey=Environment,ParameterValue=Production \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-### 3. Wait for completion
+### 2. Wait for completion
 ```bash
 aws cloudformation wait stack-create-complete --stack-name N8N
 ```
 
-### 4. Get the stack outputs
+### 3. Get the stack outputs
 ```bash
 aws cloudformation describe-stacks --stack-name N8N \
   --query "Stacks[0].Outputs" --output table
 ```
 
-### 5. Update your DNS
+### 4. Update your DNS
 Point your domain's A record to the `N8NServerPublicIP` output value.
 
-### 6. Access n8n
+### 5. Access n8n
 Visit `https://your-domain.com` in your browser.
 
 ## Parameters
@@ -105,7 +94,6 @@ Visit `https://your-domain.com` in your browser.
 | `InstanceType` | `t4g.micro` | EC2 instance type (ARM options are cheaper) |
 | `DomainName` | (required) | Domain name for n8n (must point to EC2 IP) |
 | `N8nVersion` | `1.121.3` | n8n Docker image version |
-| `KeyPairName` | (required) | Existing EC2 key pair name |
 | `BackupFrequencyMinutes` | `60` | How often to backup to DynamoDB |
 | `Environment` | `Production` | Environment tag (Production/Staging/Development) |
 
@@ -176,8 +164,7 @@ aws ssm start-session --target <instance-id>
 
 Or use the AWS Console: `EC2 > Instances > N8N-Server > Connect > Session Manager`
 
-### SSH (Optional)
-If you need SSH access, temporarily add port 22 to the security group and use your key pair.
+No SSH keys are required - SSM Session Manager provides secure shell access through the AWS Console or CLI.
 
 ## Cleanup
 ```bash
@@ -189,10 +176,6 @@ aws cloudformation wait stack-delete-complete --stack-name N8N
 - Export the DynamoDB table to S3 before deletion
 - Or set `DeletionPolicy: Retain` on the N8NBackupTable resource
 
-To delete the key pair:
-```bash
-aws ec2 delete-key-pair --key-name N8N-KeyPair
-```
 
 ## Cost Estimate
 
@@ -263,7 +246,6 @@ Go to your repository **Settings → Secrets and variables → Actions** and add
 |--------|-------------|
 | `AWS_ROLE_ARN` | ARN of the IAM role created above |
 | `DOMAIN_NAME` | Your domain (e.g., `n8n.example.com`) |
-| `KEY_PAIR_NAME` | Name of your EC2 key pair |
 
 #### 3. Enable GitHub OIDC Provider in AWS
 
@@ -293,7 +275,7 @@ The workflow will:
 5. ✅ Verify n8n is accessible
 
 #### Deploy from scratch
-If creating a new stack, the workflow will use the `DOMAIN_NAME` and `KEY_PAIR_NAME` secrets.
+If creating a new stack, the workflow will use the `DOMAIN_NAME` secret for the domain configuration.
 
 #### Monitor deployment
 Check the **Actions** tab for workflow runs. Each step provides detailed summaries in the GitHub Actions UI.

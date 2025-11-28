@@ -13,7 +13,6 @@ Metadata:
           default: "Infrastructure"
         Parameters:
           - InstanceType
-          - KeyPairName
       - Label:
           default: "Backup & Environment"
         Parameters:
@@ -40,10 +39,6 @@ Parameters:
     Type: String
     Default: "1.121.3"
     Description: "Version tag of the n8n Docker image. Update this and run stack update to upgrade n8n."
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: "Name of an existing EC2 SSH key pair whose public key is imported before deployment."
 
   BackupFrequencyMinutes:
     Type: Number
@@ -461,7 +456,6 @@ Resources:
 
     Properties:
       InstanceType: !Ref InstanceType
-      KeyName: !Ref KeyPairName
       ImageId:
         !Sub
           - "{{resolve:ssm:${AmiParam}}}"

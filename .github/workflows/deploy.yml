@@ -91,7 +91,6 @@ jobs:
           
           # Build parameters
           PARAMS="ParameterKey=DomainName,UsePreviousValue=true"
-          PARAMS="$PARAMS ParameterKey=KeyPairName,UsePreviousValue=true"
           PARAMS="$PARAMS ParameterKey=InstanceType,UsePreviousValue=true"
           PARAMS="$PARAMS ParameterKey=BackupFrequencyMinutes,UsePreviousValue=true"
           PARAMS="$PARAMS ParameterKey=Environment,UsePreviousValue=true"
@@ -131,7 +130,6 @@ jobs:
             --template-body file://cloudformation/template.yaml \
             --parameters \
               ParameterKey=DomainName,ParameterValue=${{ secrets.DOMAIN_NAME }} \
-              ParameterKey=KeyPairName,ParameterValue=${{ secrets.KEY_PAIR_NAME }} \
               ParameterKey=N8nVersion,ParameterValue=$N8N_VERSION \
             --capabilities CAPABILITY_NAMED_IAM
           
