@@ -1,0 +1,528 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "n8n Workflow Automation Platform on EC2 with Docker, SQLite, HTTPS via Caddy, and DynamoDB backup. Supports in-place updates via cfn-hup."
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "N8N Configuration"
+        Parameters:
+          - DomainName
+          - N8nVersion
+      - Label:
+          default: "Infrastructure"
+        Parameters:
+          - InstanceType
+          - KeyPairName
+      - Label:
+          default: "Backup & Environment"
+        Parameters:
+          - BackupFrequencyMinutes
+          - Environment
+
+Parameters:
+
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    Description: "EC2 instance type. t4g.micro (ARM) is cheapest, t3.micro (x86) is also possible."
+    AllowedValues:
+      - t4g.micro
+      - t4g.small
+      - t3.micro
+      - t3.small
+
+  DomainName:
+    Type: String
+    Description: "Domain name for n8n instance (must point to this EC2 public IP)."
+
+  N8nVersion:
+    Type: String
+    Default: "1.121.3"
+    Description: "Version tag of the n8n Docker image. Update this and run stack update to upgrade n8n."
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Name of an existing EC2 SSH key pair whose public key is imported before deployment."
+
+  BackupFrequencyMinutes:
+    Type: Number
+    Default: 60
+    Description: "How often to backup workflows/credentials to DynamoDB (in minutes)."
+
+  Environment:
+    Type: String
+    Default: Production
+    Description: "Environment tag for all resources."
+    AllowedValues:
+      - Production
+      - Staging
+      - Development
+
+Mappings:
+  InstanceArchitecture:
+    t4g.micro:
+      Arch: arm64
+    t4g.small:
+      Arch: arm64
+    t3.micro:
+      Arch: amd64
+    t3.small:
+      Arch: amd64
+
+  AmiSsmParameters:
+    amd64:
+      Name: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    arm64:
+      Name: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2
+
+Resources:
+
+  # DynamoDB table for storing n8n backups
+  N8NBackupTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-Backup"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Backup"
+        - Key: Project
+          Value: N8N
+        - Key: Environment
+          Value: !Ref Environment
+
+  N8NSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-SecurityGroup"
+      GroupDescription: "Security group for n8n with HTTP/HTTPS access"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-SecurityGroup"
+        - Key: Project
+          Value: N8N
+        - Key: Environment
+          Value: !Ref Environment
+
+  N8NInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-DynamoDBBackupAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt N8NBackupTable.Arn
+        - PolicyName: !Sub "${AWS::StackName}-CloudFormationSignal"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:SignalResource
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-InstanceRole"
+        - Key: Project
+          Value: N8N
+        - Key: Environment
+          Value: !Ref Environment
+
+  N8NInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${AWS::StackName}-InstanceProfile"
+      Roles:
+        - !Ref N8NInstanceRole
+
+  N8NEC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: N8NBackupTable
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - install_cfn
+            - install_docker
+            - configure_n8n
+            - start_services
+          update:
+            - configure_n8n
+            - restart_services
+
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.N8NEC2Instance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource N8NEC2Instance --configsets update --region ${AWS::Region}
+                runas=root
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+        install_docker:
+          packages:
+            yum:
+              docker: []
+              jq: []
+          commands:
+            01_install_docker_compose:
+              command: |
+                ARCH=$(uname -m)
+                curl -fSL "https://github.com/docker/compose/releases/download/v2.18.1/docker-compose-Linux-${ARCH}" -o /usr/local/bin/docker-compose
+                chmod +x /usr/local/bin/docker-compose
+            02_add_user_to_docker:
+              command: usermod -a -G docker ec2-user
+          services:
+            sysvinit:
+              docker:
+                enabled: true
+                ensureRunning: true
+
+        configure_n8n:
+          commands:
+            01_setup_directories:
+              command: |
+                mkdir -p /opt/n8n/caddy /opt/n8n/data /opt/n8n/scripts
+                chown -R ec2-user:ec2-user /opt/n8n
+          files:
+            /opt/n8n/scripts/import-from-dynamodb.sh:
+              content: !Sub |
+                #!/bin/bash
+                set -e
+                BACKUP_TABLE="${N8NBackupTable}"
+                AWS_REGION="${AWS::Region}"
+                N8N_DATA_DIR="/opt/n8n/data"
+
+                echo "[$(date)] Starting import from DynamoDB..."
+
+                # Check if encryption key exists in DynamoDB
+                ENCRYPTION_KEY=$(aws dynamodb get-item \
+                  --table-name "$BACKUP_TABLE" \
+                  --key '{"pk": {"S": "encryption_key"}}' \
+                  --region "$AWS_REGION" \
+                  --query 'Item.data.S' \
+                  --output text 2>/dev/null || echo "")
+
+                if [ -n "$ENCRYPTION_KEY" ] && [ "$ENCRYPTION_KEY" != "None" ]; then
+                  echo "[$(date)] Found encryption key in DynamoDB"
+                  echo "$ENCRYPTION_KEY" > $N8N_DATA_DIR/.encryption_key
+                else
+                  echo "[$(date)] No encryption key found, generating new one..."
+                  openssl rand -hex 16 > $N8N_DATA_DIR/.encryption_key
+                  NEW_KEY=$(cat $N8N_DATA_DIR/.encryption_key)
+                  aws dynamodb put-item \
+                    --table-name "$BACKUP_TABLE" \
+                    --item "{\"pk\": {\"S\": \"encryption_key\"}, \"data\": {\"S\": \"$NEW_KEY\"}, \"updated_at\": {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+                    --region "$AWS_REGION"
+                  echo "[$(date)] New encryption key stored in DynamoDB"
+                fi
+
+                # Import workflows if they exist
+                WORKFLOWS_BACKUP=$(aws dynamodb get-item \
+                  --table-name "$BACKUP_TABLE" \
+                  --key '{"pk": {"S": "workflows"}}' \
+                  --region "$AWS_REGION" \
+                  --query 'Item.data.S' \
+                  --output text 2>/dev/null || echo "")
+
+                if [ -n "$WORKFLOWS_BACKUP" ] && [ "$WORKFLOWS_BACKUP" != "None" ]; then
+                  mkdir -p $N8N_DATA_DIR/import
+                  echo "$WORKFLOWS_BACKUP" | base64 -d > $N8N_DATA_DIR/import/workflows.json
+                  echo "[$(date)] Workflows saved for import"
+                fi
+
+                # Import credentials if they exist
+                CREDENTIALS_BACKUP=$(aws dynamodb get-item \
+                  --table-name "$BACKUP_TABLE" \
+                  --key '{"pk": {"S": "credentials"}}' \
+                  --region "$AWS_REGION" \
+                  --query 'Item.data.S' \
+                  --output text 2>/dev/null || echo "")
+
+                if [ -n "$CREDENTIALS_BACKUP" ] && [ "$CREDENTIALS_BACKUP" != "None" ]; then
+                  mkdir -p $N8N_DATA_DIR/import
+                  echo "$CREDENTIALS_BACKUP" | base64 -d > $N8N_DATA_DIR/import/credentials.json
+                  echo "[$(date)] Credentials saved for import"
+                fi
+
+                echo "[$(date)] Import complete"
+              mode: "000755"
+              owner: root
+              group: root
+
+            /opt/n8n/scripts/export-to-dynamodb.sh:
+              content: !Sub |
+                #!/bin/bash
+                set -e
+                BACKUP_TABLE="${N8NBackupTable}"
+                AWS_REGION="${AWS::Region}"
+                N8N_DATA_DIR="/opt/n8n/data"
+
+                echo "[$(date)] Starting export to DynamoDB..."
+
+                # Export workflows
+                WORKFLOWS_JSON=$(docker exec n8n-n8n-1 n8n export:workflow --all 2>/dev/null || echo "[]")
+                if [ -n "$WORKFLOWS_JSON" ] && [ "$WORKFLOWS_JSON" != "[]" ]; then
+                  WORKFLOWS_B64=$(echo "$WORKFLOWS_JSON" | base64 -w 0)
+                  aws dynamodb put-item \
+                    --table-name "$BACKUP_TABLE" \
+                    --item "{\"pk\": {\"S\": \"workflows\"}, \"data\": {\"S\": \"$WORKFLOWS_B64\"}, \"updated_at\": {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+                    --region "$AWS_REGION"
+                  echo "[$(date)] Workflows backed up"
+                fi
+
+                # Export credentials
+                CREDENTIALS_JSON=$(docker exec n8n-n8n-1 n8n export:credentials --all 2>/dev/null || echo "[]")
+                if [ -n "$CREDENTIALS_JSON" ] && [ "$CREDENTIALS_JSON" != "[]" ]; then
+                  CREDENTIALS_B64=$(echo "$CREDENTIALS_JSON" | base64 -w 0)
+                  aws dynamodb put-item \
+                    --table-name "$BACKUP_TABLE" \
+                    --item "{\"pk\": {\"S\": \"credentials\"}, \"data\": {\"S\": \"$CREDENTIALS_B64\"}, \"updated_at\": {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+                    --region "$AWS_REGION"
+                  echo "[$(date)] Credentials backed up"
+                fi
+
+                # Backup SQLite database
+                if [ -f "$N8N_DATA_DIR/database.sqlite" ]; then
+                  DB_B64=$(base64 -w 0 "$N8N_DATA_DIR/database.sqlite")
+                  aws dynamodb put-item \
+                    --table-name "$BACKUP_TABLE" \
+                    --item "{\"pk\": {\"S\": \"database_sqlite\"}, \"data\": {\"S\": \"$DB_B64\"}, \"updated_at\": {\"S\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}" \
+                    --region "$AWS_REGION"
+                  echo "[$(date)] Database backed up"
+                fi
+
+                echo "[$(date)] Export complete"
+              mode: "000755"
+              owner: root
+              group: root
+
+            /opt/n8n/docker-compose.yml:
+              content: !Sub |
+                version: "3.8"
+
+                services:
+                  n8n:
+                    image: docker.n8n.io/n8nio/n8n:${N8nVersion}
+                    restart: always
+                    expose:
+                      - "5678"
+                    environment:
+                      - N8N_ENCRYPTION_KEY=${!N8N_KEY}
+                      - DB_TYPE=sqlite
+                      - DB_SQLITE_PATH=/home/node/.n8n/database.sqlite
+                      - N8N_BASIC_AUTH_ACTIVE=false
+                      - N8N_HOST=${DomainName}
+                      - N8N_PORT=5678
+                      - N8N_PROTOCOL=https
+                      - N8N_PATH=/
+                    volumes:
+                      - ./data:/home/node/.n8n
+
+                  caddy:
+                    image: caddy:2
+                    restart: always
+                    ports:
+                      - "80:80"
+                      - "443:443"
+                    volumes:
+                      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+                      - caddy_data:/data
+                      - caddy_config:/config
+                    depends_on:
+                      - n8n
+
+                volumes:
+                  caddy_data:
+                  caddy_config:
+              mode: "000644"
+              owner: ec2-user
+              group: ec2-user
+
+            /opt/n8n/caddy/Caddyfile:
+              content: !Sub |
+                ${DomainName} {
+                  encode zstd gzip
+                  reverse_proxy n8n:5678
+                }
+              mode: "000644"
+              owner: ec2-user
+              group: ec2-user
+
+            /opt/n8n/scripts/update-n8n.sh:
+              content: |
+                #!/bin/bash
+                set -e
+                cd /opt/n8n
+
+                # Read encryption key
+                if [ -f /opt/n8n/data/.encryption_key ]; then
+                  export N8N_KEY=$(cat /opt/n8n/data/.encryption_key)
+                else
+                  echo "ERROR: No encryption key found"
+                  exit 1
+                fi
+
+                # Substitute the key into docker-compose.yml
+                sed -i "s|\${!N8N_KEY}|$N8N_KEY|g" /opt/n8n/docker-compose.yml
+
+                # Pull and restart
+                /usr/local/bin/docker-compose pull
+                /usr/local/bin/docker-compose up -d
+
+                echo "[$(date)] n8n updated successfully"
+              mode: "000755"
+              owner: root
+              group: root
+
+        start_services:
+          commands:
+            01_import_from_dynamodb:
+              command: /opt/n8n/scripts/import-from-dynamodb.sh
+            02_prepare_docker_compose:
+              command: |
+                cd /opt/n8n
+                N8N_KEY=$(cat /opt/n8n/data/.encryption_key)
+                sed -i "s|\${!N8N_KEY}|$N8N_KEY|g" /opt/n8n/docker-compose.yml
+            03_start_n8n:
+              command: |
+                cd /opt/n8n
+                /usr/local/bin/docker-compose up -d
+            04_setup_backup_cron:
+              command: !Sub |
+                (crontab -l 2>/dev/null || echo "") | grep -v "export-to-dynamodb" | { cat; echo "*/${BackupFrequencyMinutes} * * * * /opt/n8n/scripts/export-to-dynamodb.sh >> /var/log/n8n-backup.log 2>&1"; } | crontab -
+
+        restart_services:
+          commands:
+            01_update_n8n:
+              command: /opt/n8n/scripts/update-n8n.sh
+
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId:
+        !Sub
+          - "{{resolve:ssm:${AmiParam}}}"
+          - AmiParam: !FindInMap
+              - AmiSsmParameters
+              - !FindInMap [InstanceArchitecture, !Ref InstanceType, Arch]
+              - Name
+      SecurityGroupIds:
+        - !Ref N8NSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            DeleteOnTermination: true
+      IamInstanceProfile: !Ref N8NInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Server"
+        - Key: Project
+          Value: N8N
+        - Key: Environment
+          Value: !Ref Environment
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y aws-cfn-bootstrap
+
+          # Run cfn-init
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource N8NEC2Instance --configsets default --region ${AWS::Region}
+
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource N8NEC2Instance --region ${AWS::Region}
+
+Outputs:
+
+  N8NURL:
+    Description: "URL to access your n8n instance (HTTPS)"
+    Value: !Sub "https://${DomainName}"
+
+  N8NServerInstanceId:
+    Description: "EC2 Instance ID for N8N Server"
+    Value: !Ref N8NEC2Instance
+
+  N8NServerPublicIP:
+    Description: "Public IP address of N8N Server (update your DNS A record to this)"
+    Value: !GetAtt N8NEC2Instance.PublicIp
+
+  N8NBackupTableName:
+    Description: "DynamoDB table name for n8n backups"
+    Value: !Ref N8NBackupTable
+
+  N8NBackupTableArn:
+    Description: "DynamoDB table ARN for n8n backups"
+    Value: !GetAtt N8NBackupTable.Arn
+
+  UpdateInstructions:
+    Description: "How to update n8n version or configuration"
+    Value: !Sub |
+      To update n8n or configuration in-place:
+      1. Modify the CloudFormation parameters (e.g., N8nVersion)
+      2. Run: aws cloudformation update-stack --stack-name ${AWS::StackName} --template-body file://cloudformation/template.yaml --parameters ... --capabilities CAPABILITY_NAMED_IAM
+      3. The cfn-hup daemon on the instance will detect the change and apply it automatically within 1 minute.

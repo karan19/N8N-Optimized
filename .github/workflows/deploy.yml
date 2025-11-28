@@ -1,0 +1,311 @@
+name: N8N-Optimized CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      n8n_version:
+        description: 'N8N Version (leave empty to use default from template)'
+        required: false
+        type: string
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'update'
+        type: choice
+        options:
+          - update
+          - deploy-new
+          - status
+          - delete
+
+env:
+  AWS_REGION: us-west-2
+  STACK_NAME: N8N-Optimized
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Validate CloudFormation template
+  validate:
+    name: Validate Template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://cloudformation/template.yaml
+          echo "✅ Template is valid!" >> $GITHUB_STEP_SUMMARY
+
+  # Deploy or Update Stack
+  deploy:
+    name: Deploy / Update Stack
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.action != 'delete' && github.event.inputs.action != 'status')
+    outputs:
+      instance_id: ${{ steps.outputs.outputs.instance_id }}
+      public_ip: ${{ steps.outputs.outputs.public_ip }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check if stack exists
+        id: check-stack
+        run: |
+          if aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "📦 Stack exists, will update" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "🆕 Stack does not exist, will create" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Update existing stack
+        if: steps.check-stack.outputs.exists == 'true'
+        run: |
+          echo "🔄 Updating stack..."
+          
+          # Build parameters
+          PARAMS="ParameterKey=DomainName,UsePreviousValue=true"
+          PARAMS="$PARAMS ParameterKey=KeyPairName,UsePreviousValue=true"
+          PARAMS="$PARAMS ParameterKey=InstanceType,UsePreviousValue=true"
+          PARAMS="$PARAMS ParameterKey=BackupFrequencyMinutes,UsePreviousValue=true"
+          PARAMS="$PARAMS ParameterKey=Environment,UsePreviousValue=true"
+          
+          # Add version if specified
+          if [ -n "${{ github.event.inputs.n8n_version }}" ]; then
+            PARAMS="$PARAMS ParameterKey=N8nVersion,ParameterValue=${{ github.event.inputs.n8n_version }}"
+          else
+            PARAMS="$PARAMS ParameterKey=N8nVersion,UsePreviousValue=true"
+          fi
+          
+          aws cloudformation update-stack \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-body file://cloudformation/template.yaml \
+            --parameters $PARAMS \
+            --capabilities CAPABILITY_NAMED_IAM 2>&1 || {
+              if [[ $? -eq 255 ]] && [[ $(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --query "Stacks[0].StackStatus" --output text) == *"COMPLETE"* ]]; then
+                echo "ℹ️ No changes to update" >> $GITHUB_STEP_SUMMARY
+                exit 0
+              fi
+              exit 1
+            }
+          
+          echo "⏳ Waiting for update to complete..."
+          aws cloudformation wait stack-update-complete --stack-name ${{ env.STACK_NAME }}
+          echo "✅ Stack updated successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Create new stack
+        if: steps.check-stack.outputs.exists == 'false' && (github.event.inputs.action == 'deploy-new' || github.event_name == 'push')
+        run: |
+          echo "🚀 Creating new stack..."
+          
+          N8N_VERSION="${{ github.event.inputs.n8n_version || '1.121.3' }}"
+          
+          aws cloudformation create-stack \
+            --stack-name ${{ env.STACK_NAME }} \
+            --template-body file://cloudformation/template.yaml \
+            --parameters \
+              ParameterKey=DomainName,ParameterValue=${{ secrets.DOMAIN_NAME }} \
+              ParameterKey=KeyPairName,ParameterValue=${{ secrets.KEY_PAIR_NAME }} \
+              ParameterKey=N8nVersion,ParameterValue=$N8N_VERSION \
+            --capabilities CAPABILITY_NAMED_IAM
+          
+          echo "⏳ Waiting for stack creation..."
+          aws cloudformation wait stack-create-complete --stack-name ${{ env.STACK_NAME }}
+          echo "✅ Stack created successfully!" >> $GITHUB_STEP_SUMMARY
+
+      - name: Get Stack Outputs
+        id: outputs
+        run: |
+          INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='N8NServerInstanceId'].OutputValue" --output text)
+          PUBLIC_IP=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='N8NServerPublicIP'].OutputValue" --output text)
+          URL=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='N8NURL'].OutputValue" --output text)
+          
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          
+          echo "## 📊 Stack Outputs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Output | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance ID | \`$INSTANCE_ID\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Public IP | \`$PUBLIC_IP\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | $URL |" >> $GITHUB_STEP_SUMMARY
+
+  # Wait for cfn-hup to process updates
+  wait-for-update:
+    name: Wait for In-Place Update
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: needs.deploy.outputs.instance_id != ''
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for cfn-hup to apply changes
+        run: |
+          echo "⏳ Waiting 90 seconds for cfn-hup to detect and apply changes..."
+          sleep 90
+          echo "✅ cfn-hup should have applied changes" >> $GITHUB_STEP_SUMMARY
+
+  # Refresh Caddy for SSL
+  refresh-caddy:
+    name: Refresh Caddy (SSL)
+    runs-on: ubuntu-latest
+    needs: [deploy, wait-for-update]
+    if: needs.deploy.outputs.instance_id != ''
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Restart Caddy via SSM
+        run: |
+          INSTANCE_ID="${{ needs.deploy.outputs.instance_id }}"
+          
+          echo "🔄 Restarting Caddy for SSL certificate refresh..."
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /opt/n8n && docker-compose restart caddy"]' \
+            --query "Command.CommandId" \
+            --output text)
+          
+          echo "Command ID: $COMMAND_ID"
+          
+          # Wait for command to complete
+          sleep 15
+          
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query "Status" \
+            --output text)
+          
+          if [ "$STATUS" == "Success" ]; then
+            echo "✅ Caddy restarted successfully!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Caddy restart status: $STATUS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Verify deployment
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy, refresh-caddy]
+    if: needs.deploy.outputs.instance_id != ''
+    
+    steps:
+      - name: Wait for services to stabilize
+        run: sleep 30
+
+      - name: Check n8n is accessible
+        run: |
+          URL="https://${{ secrets.DOMAIN_NAME }}"
+          
+          echo "🔍 Checking $URL..."
+          
+          HTTP_STATUS=$(curl -sI "$URL" --connect-timeout 30 -o /dev/null -w "%{http_code}" || echo "000")
+          
+          if [ "$HTTP_STATUS" == "200" ]; then
+            echo "## ✅ Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "n8n is accessible at: $URL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Health Check" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "HTTP Status: $HTTP_STATUS" >> $GITHUB_STEP_SUMMARY
+            echo "URL: $URL" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Note: Site may still be initializing or DNS may need to propagate." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Status check (manual trigger only)
+  status:
+    name: Check Stack Status
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'status'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Stack Status
+        run: |
+          echo "## 📊 Stack Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0]" --output yaml >> $GITHUB_STEP_SUMMARY
+
+      - name: Check Container Status via SSM
+        run: |
+          INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} \
+            --query "Stacks[0].Outputs[?OutputKey=='N8NServerInstanceId'].OutputValue" --output text)
+          
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["docker ps --format \"table {{.Names}}\t{{.Image}}\t{{.Status}}\""]' \
+            --query "Command.CommandId" \
+            --output text
+
+  # Delete stack (manual trigger only, requires approval)
+  delete:
+    name: Delete Stack
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'delete'
+    environment: production
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete Stack
+        run: |
+          echo "⚠️ Deleting stack ${{ env.STACK_NAME }}..."
+          aws cloudformation delete-stack --stack-name ${{ env.STACK_NAME }}
+          aws cloudformation wait stack-delete-complete --stack-name ${{ env.STACK_NAME }}
+          echo "✅ Stack deleted!" >> $GITHUB_STEP_SUMMARY
