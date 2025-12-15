@@ -37,7 +37,7 @@ Parameters:
 
   N8nVersion:
     Type: String
-    Default: "1.121.3"
+    Default: "1.123.5"
     Description: "Version tag of the n8n Docker image. Update this and run stack update to upgrade n8n."
 
   BackupFrequencyMinutes:
@@ -373,6 +373,8 @@ Resources:
                       - N8N_PORT=5678
                       - N8N_PROTOCOL=https
                       - N8N_PATH=/
+                      - WEBHOOK_URL=https://${DomainName}/
+                      - N8N_EDITOR_BASE_URL=https://${DomainName}/
                     volumes:
                       - ./data:/home/node/.n8n
 
