@@ -42,7 +42,7 @@ Parameters:
 
   BackupFrequencyMinutes:
     Type: Number
-    Default: 60
+    Default: 1
     Description: "How often to backup workflows/credentials to DynamoDB (in minutes)."
 
   Environment:
